@@ -1,0 +1,139 @@
+#!/bin/bash
+# Run the testbench across the base (branch-free) traces and summarize.
+#
+# These traces are all TYPE_REGULAR: flush_en is never asserted and every
+# instruction that leaves the ROB also commits. For the branch / mispredict
+# traces, use ./run_branch_traces instead.
+#
+# TOP_TB opens "traces/instructions.txt" by a path relative to the current
+# directory, so testing a different trace means copying it into place. This
+# script does that for each trace in turn, saves the full log per trace, and
+# prints a one-line-per-trace summary at the end. The original
+# traces/instructions.txt is restored on exit.
+#
+# Usage:
+#   ./run_traces                          # the base regression set
+#   ./run_traces basic wide_ilp           # just these
+#   ./run_traces --all                    # every traces/instructions_*.txt
+#   OUTDIR=somewhere ./run_traces         # override the log directory
+#
+# Build with 'make' first. This script never compiles anything, so it warns if
+# a source file is newer than ./simv.
+
+set -u
+
+cd "$(dirname "$0")"
+
+DEFAULT_SET=(basic dependent_chain wide_ilp preg_pressure stress)
+OUTDIR="${OUTDIR:-run_logs}"
+LIVE=traces/instructions.txt
+
+# -- pick the trace set ------------------------------------------------------
+if [ "$#" -eq 0 ]; then
+    TRACES=("${DEFAULT_SET[@]}")
+elif [ "$1" = "--all" ]; then
+    TRACES=()
+    for f in traces/instructions_*.txt; do
+        name="${f##*/instructions_}"
+        TRACES+=("${name%.txt}")
+    done
+else
+    TRACES=("$@")
+fi
+
+if [ ! -x ./simv ]; then
+    echo "[FAIL] ./simv not found. Build it with 'make' first."
+    exit 1
+fi
+
+# -- describe what is actually being tested ----------------------------------
+# This script only runs ./simv, it never compiles. Recording when the binary was
+# built makes every log self-describing about what it tested, rather than about
+# what someone assumed it tested.
+SIMV_BUILT="$(date -r ./simv '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo unknown)"
+
+# Warn if a source file is newer than the binary: whatever the summary says, it
+# did not test that edit.
+STALE=""
+for src in $(find verilog_src -name '*.sv' -o -name '*.svh' 2>/dev/null); do
+    [ "$src" -nt ./simv ] && STALE="$STALE $src"
+done
+
+echo "[INFO] simv built: $SIMV_BUILT"
+if [ -n "$STALE" ]; then
+    echo "[WARN] these sources are newer than ./simv -- rebuild with 'make' before trusting this run:"
+    for s in $STALE; do echo "[WARN]     $s"; done
+fi
+echo
+
+mkdir -p "$OUTDIR"
+
+# -- preserve whatever is currently in place ---------------------------------
+RESTORE=""
+if [ -f "$LIVE" ]; then
+    RESTORE="$(mktemp)"
+    cp "$LIVE" "$RESTORE"
+fi
+cleanup() {
+    if [ -n "$RESTORE" ]; then cp "$RESTORE" "$LIVE"; rm -f "$RESTORE"; fi
+}
+trap cleanup EXIT
+
+# -- run ---------------------------------------------------------------------
+declare -a SUMMARY
+OVERALL=0
+
+for t in "${TRACES[@]}"; do
+    src="traces/instructions_${t}.txt"
+    log="$OUTDIR/${t}.out"
+
+    if [ ! -f "$src" ]; then
+        echo "[WARN] no such trace: $src (skipping)"
+        SUMMARY+=("$(printf '%-18s %s' "$t" 'MISSING')")
+        OVERALL=1
+        continue
+    fi
+
+    printf '[INFO] %-18s ' "$t"
+    cp "$src" "$LIVE"
+    ./simv > "$log" 2>&1
+
+    n_inst=$(wc -l < "$src" | tr -d ' ')
+    passes=$(grep -c '^\[PASS\]' "$log")
+    fails=$(grep -c '^\[ERROR\].*check failed' "$log")
+    asserts=$(grep -c 'Offending' "$log")
+    early=$(grep -c 'Simulation ended early' "$log")
+
+    if [ "$early" -gt 0 ]; then
+        verdict="ABORTED EARLY (full/stall timeout)"
+        OVERALL=1
+    elif [ "$fails" -gt 0 ] || [ "$asserts" -gt 0 ]; then
+        verdict="FAIL  ${passes} passed, ${fails} checks failed, ${asserts} assertions"
+        OVERALL=1
+    else
+        verdict="PASS  ${passes} checks"
+    fi
+
+    echo "$verdict"
+    SUMMARY+=("$(printf '%-18s %6s inst  %s' "$t" "$n_inst" "$verdict")")
+done
+
+# -- summary -----------------------------------------------------------------
+echo
+echo "======================================================================"
+echo "${SUMMARY_TITLE:-BASE TRACE SUMMARY}                (full logs in $OUTDIR/)"
+echo "======================================================================"
+echo "  simv built $SIMV_BUILT"
+if [ -n "$STALE" ]; then
+    echo "  WARNING: sources newer than simv -- this run did not test your latest edits"
+fi
+echo "  ----------------------------------------------------------------"
+for line in "${SUMMARY[@]}"; do echo "  $line"; done
+echo
+
+if [ "$OVERALL" -eq 0 ]; then
+    echo "[PASS] all traces clean"
+else
+    echo "[FAIL] at least one trace has failures -- see $OUTDIR/"
+fi
+exit "$OVERALL"

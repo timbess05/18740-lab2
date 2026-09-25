@@ -1,0 +1,47 @@
+# VCS build products
+simv
+simv.daidir/
+csrc/
+ucli.key
+DVEfiles/
+*.vpd
+*.vcd
+vc_hdrs.h
+.vcs_lib_lock
+AN.DB/
+
+# Simulation logs
+*.out
+run_logs/
+run_logs_branch/
+
+# Python
+__pycache__/
+*.pyc
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/
+
+# Submission archive
+final_lab2.zip
+
+# Leaderboard scratch
+.leaderboard_work/
+
+# Credentials -- never commit
+staff/service_account.json
+*.keytab
+
+# Synthesis outputs
+Reps/
+Results/
+Logs/
+*.rpt
+
+# Staff leaderboard state
+staff/rejected.log
+staff/cron.log

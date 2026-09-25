@@ -1,0 +1,5 @@
+# Two cores sharing 0x10000, globally sorted.
+0 0 W 0x10000
+0 1 R 0x10000
+1 0 W 0x10000
+2 1 R 0x10000

@@ -1,0 +1,7 @@
+# Concatenated per-core streams; no global ordering constraint.
+0 0 R 0x1000
+10 0 R 0x1040
+20 0 W 0x1000
+
+0 2 R 0x9000
+5 2 R 0x9040

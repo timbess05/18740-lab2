@@ -1,0 +1,4 @@
+# 0x0000 and 0x0080 collide in set 0 of a 128B direct-mapped cache. The second
+# access evicts a dirty line.
+0 0 W 0x0000
+0 0 R 0x0080

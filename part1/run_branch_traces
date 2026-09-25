@@ -1,0 +1,71 @@
+#!/bin/bash
+# Run the testbench across the BRANCH traces.
+#
+# These are the only traces containing non-zero inst_type: TYPE_BRANCH (1) for a
+# correctly-predicted branch and TYPE_FLUSH (2) for a mispredicting one. Only
+# TYPE_FLUSH actually asserts flush_en, so the mispredict count -- not the
+# branch count -- is what determines how much recovery logic gets exercised.
+#
+# For the base regression (all TYPE_REGULAR), use ./run_traces instead.
+#
+# Usage:
+#   ./run_branch_traces                       # the branching test set
+#   ./run_branch_traces branch_basic          # just this one
+#
+# Build with 'make' first. This script never compiles anything.
+
+set -u
+
+cd "$(dirname "$0")"
+
+BRANCH_SET=(branch_basic branch_stress)
+
+# -- report what the branch path currently supports --------------------
+# Convenience only, so that a wall of flush failures is not mysterious.
+#
+# Reads the modules 'make' compiles. It cannot know what ./simv was actually
+# built from, so it names the directory it inspected.
+DUT_DIR=verilog_src/rename_modules
+SUF=""
+
+missing=()
+[ "$(grep -c flush_en    $DUT_DIR/iq$SUF.sv  2>/dev/null || echo 0)" -gt 1 ] || missing+=("IQ does not act on flush_en")
+[ "$(grep -c flush_index $DUT_DIR/rob$SUF.sv 2>/dev/null || echo 0)" -gt 1 ] || missing+=("ROB does not act on flush_index")
+[ "$(grep -c flush_index $DUT_DIR/rru$SUF.sv 2>/dev/null || echo 0)" -gt 1 ] || missing+=("RRU does not act on flush_index")
+[ "$(grep -c stall       $DUT_DIR/rru$SUF.sv 2>/dev/null || echo 0)" -gt 1 ] || missing+=("RRU never asserts stall (branch checkpoints)")
+
+if [ "${#missing[@]}" -gt 0 ]; then
+    echo "======================================================================"
+    echo "NOTE: flush support looks incomplete in $DUT_DIR/"
+    echo "======================================================================"
+    for m in "${missing[@]}"; do echo "  - $m"; done
+    echo
+fi
+
+# -- show how much recovery each trace actually exercises --------------------
+echo "Branch trace contents:"
+printf "  %-18s %8s %8s %14s\n" trace instrs branches mispredicts
+for t in "${@:-${BRANCH_SET[@]}}"; do
+    f="traces/instructions_${t}.txt"
+    [ -f "$f" ] || { printf "  %-18s %8s\n" "$t" "MISSING"; continue; }
+    python3 - "$f" "$t" <<'PY'
+import re, sys
+path, name = sys.argv[1], sys.argv[2]
+n = b = m = 0
+for ln in open(path):
+    g = re.match(r"\d+ \| \d+, \d+ -> \d+ \| \d+, (\d+)", ln)
+    if not g: continue
+    n += 1
+    t = int(g.group(1))
+    if t == 1: b += 1
+    elif t == 2: m += 1
+print(f"  {name:<18} {n:8d} {b:8d} {m:14d}")
+PY
+done
+echo
+
+# -- delegate the actual run loop to the base runner -------------------------
+# Same build check, log capture, summary and restore-on-exit logic; only the
+# trace set, log directory and summary heading differ.
+OUTDIR=run_logs_branch SUMMARY_TITLE="BRANCH TRACE SUMMARY" \
+    ./run_traces "${@:-${BRANCH_SET[@]}}"

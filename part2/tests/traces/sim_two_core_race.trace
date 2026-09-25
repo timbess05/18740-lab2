@@ -1,0 +1,3 @@
+# Both cores ready at cycle 0 on unrelated lines: tests arbitration order.
+0 0 R 0x1000
+0 1 R 0x9000

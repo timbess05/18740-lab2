@@ -1,0 +1,136 @@
+#!/bin/bash
+#
+# Packages your work for submission into final_lab2.zip.
+#
+#   ./make_final                 build the archive
+#   ./make_final --list          show what would go in, without writing anything
+#
+# Everything under part1/verilog_src/ is collected, so any module-level
+# testbenches or helper files you add are picked up automatically -- just keep
+# them in there. The part2 protocols are collected too.
+#
+# Traces, run scripts, Makefiles and the part2 simulator are not included; those
+# are the same for everyone.
+#
+# Your report is submitted separately as a PDF; it does not go in this archive.
+
+set -u
+
+cd "$(dirname "$0")"
+
+ARCHIVE=final_lab2.zip
+
+# Swept wholesale, so anything you add is included without editing this script.
+SWEEP_DIR=part1/verilog_src
+
+# Collected by name, because part2/src/ also holds the simulator itself.
+PART2_FILES=(
+  part2/src/protocol_mesi.cpp
+  part2/src/protocol_mosi.cpp
+  part2/src/protocol_moesi.cpp
+)
+
+# Must exist. Anything else under $SWEEP_DIR is optional and yours to organise.
+REQUIRED=(
+  part1/verilog_src/rename_modules/rob.sv
+  part1/verilog_src/rename_modules/iq.sv
+  part1/verilog_src/rename_modules/prf.sv
+  part1/verilog_src/rename_modules/rru.sv
+  part1/verilog_src/rename_modules/rename_top.sv
+  part1/verilog_src/global_defines.svh
+  part1/verilog_src/tb_top.sv
+)
+
+# The four files that ship as stubs, for the unfinished-work warning below.
+STUB_FILES=(
+  part1/verilog_src/rename_modules/rob.sv
+  part1/verilog_src/rename_modules/iq.sv
+  part1/verilog_src/rename_modules/prf.sv
+  part1/verilog_src/rename_modules/rru.sv
+)
+
+list_only=0
+for arg in "$@"; do
+  case "${arg#--}" in
+    list)    list_only=1 ;;
+    help|h)  sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *)       echo "make_final: unknown flag '$arg' (try --help)" >&2; exit 2 ;;
+  esac
+done
+
+# -- required files ----------------------------------------------------------
+missing=()
+for f in "${REQUIRED[@]}"; do
+  [ -f "$f" ] || missing+=("$f")
+done
+if [ "${#missing[@]}" -gt 0 ]; then
+  echo "make_final: these files are missing -- submit from the top of the repo" >&2
+  for f in "${missing[@]}"; do echo "  $f" >&2; done
+  exit 1
+fi
+
+# -- collect -----------------------------------------------------------------
+# rename_test_modules/ is excluded: it is not part of a student checkout, and if
+# you have one it is not yours to submit. Editor and OS leftovers are dropped so
+# the archive holds only source.
+present=()
+while IFS= read -r f; do
+  present+=("$f")
+done < <(find "$SWEEP_DIR" -type f \
+              ! -path '*/rename_test_modules/*' \
+              ! -name '.DS_Store' ! -name '*.swp' ! -name '*~' \
+              ! -name '*.orig' ! -name '*.rej' \
+         | sort)
+
+for f in "${PART2_FILES[@]}"; do
+  if [ -f "$f" ]; then present+=("$f"); else
+    echo "make_final: missing $f" >&2; exit 1
+  fi
+done
+
+# -- warn about anything that still looks unfinished --------------------------
+# Not fatal. Partial credit is a thing, and you may be submitting deliberately
+# incomplete work. But an untouched stub is almost always an accident.
+warnings=""
+for f in "${STUB_FILES[@]}"; do
+  if grep -q "ADD YOUR CODE HERE" "$f" 2>/dev/null && [ "$(grep -c . "$f")" -lt 45 ]; then
+    warnings="$warnings\n  $f looks untouched (still just the stub)"
+  fi
+done
+for f in "${PART2_FILES[@]}"; do
+  if grep -q "not implemented" "$f" 2>/dev/null; then
+    n=$(grep -c "TODO" "$f")
+    warnings="$warnings\n  $f still throws 'not implemented' ($n TODOs remain)"
+  fi
+done
+
+# -- report ------------------------------------------------------------------
+echo "Files to submit:"
+for f in "${present[@]}"; do printf "  %-52s %s lines\n" "$f" "$(wc -l < "$f")"; done
+echo "  ${#present[@]} files"
+
+if [ -n "$warnings" ]; then
+  echo
+  echo "Warning: some files still look unfinished."
+  printf "%b\n" "$warnings"
+fi
+
+if [ "$list_only" -eq 1 ]; then
+  echo
+  echo "(--list given, nothing written)"
+  exit 0
+fi
+
+# -- build the archive -------------------------------------------------------
+if ! command -v zip >/dev/null 2>&1; then
+  echo "make_final: 'zip' not found on this machine" >&2
+  exit 1
+fi
+
+rm -f "$ARCHIVE"
+# -X drops extra file attributes so the archive is reproducible across machines.
+zip -q -X "$ARCHIVE" "${present[@]}"
+
+echo
+echo "Wrote $ARCHIVE ($(wc -c < "$ARCHIVE") bytes, ${#present[@]} files)"
+echo "Check it before submitting:  unzip -l $ARCHIVE"

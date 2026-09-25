@@ -1,0 +1,8 @@
+#!/bin/bash
+
+rm -rf genus.log*
+rm -rf genus.cmd*
+rm -rf Results/*
+rm -rf Reps/*
+rm -rf Logs/*
+rm -rf fv

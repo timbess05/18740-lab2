@@ -1,0 +1,6 @@
+# Two cores alternately reading one line. MSI shares it after two misses;
+# MI has to take ownership every single time.
+0 0 R 0x1000
+0 1 R 0x1000
+0 0 R 0x1000
+0 1 R 0x1000

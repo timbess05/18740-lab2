@@ -1,0 +1,115 @@
+#!/bin/bash
+#
+# Sweeps every protocol against every trace and prints one table per trace.
+#
+#   ./sweep [check] [real_bus] [real_memory]
+#
+# Build with 'make' first; this script only runs build/sim, it never compiles.
+#
+# Flags are additive and order does not matter:
+#
+#   check         check each protocol's state machine and fail if it is wrong.
+#                 Runs an exhaustive battery of fabricated peer configurations
+#                 before each trace, checks every real transaction against the
+#                 same FSM rules, and verifies single-writer/multiple-reader
+#                 after every access. Covers MESI, MOSI and MOESI; MI and MSI
+#                 ship as worked references and are not checked. Off by
+#                 default.
+#   real_bus      give the interconnect finite bandwidth. Ideal by default.
+#   real_memory   give main memory finite bandwidth. Ideal by default.
+#
+# With neither real_bus nor real_memory the run reports coherence traffic with
+# no timing at all: every protocol takes the same number of cycles and the
+# columns show only what each one puts on the wire. That comparison is exact.
+# Constrain one resource at a time to see which optimisation depends on which:
+# the E state saves bus transactions, the O state saves memory writes.
+#
+# Simulator configuration is otherwise the defaults in include/simulator.hpp --
+# 16 cores from the trace, 32 KiB 4-way caches, 64 B lines, 8 memory banks.
+
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+SIM=build/sim
+PROTOCOLS="MI MSI MESI MOSI MOESI"
+
+do_check=0
+real_bus=0
+real_memory=0
+
+# Prints the comment block at the top of this file, minus the '#' markers.
+usage() { awk 'NR>1 && /^#/ {sub(/^# ?/, ""); print; next} NR>1 {exit}' "$0"; }
+
+for arg in "$@"; do
+  case "${arg#--}" in
+    check)       do_check=1 ;;
+    real_bus)    real_bus=1 ;;
+    real_memory) real_memory=1 ;;
+    help|h)      usage; exit 0 ;;
+    *)
+      echo "sweep: unknown flag '$arg'" >&2
+      echo "expected any of: check real_bus real_memory" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ ! -x "$SIM" ]; then
+  echo "sweep: $SIM not found -- build it with 'make' first" >&2
+  exit 1
+fi
+
+# This script never compiles, so a source edited since the last build is not in
+# the results below. Warn rather than fail: a stale run is still worth seeing,
+# it just is not a run of what is currently on disk.
+stale=$(find src include -newer "$SIM" \( -name '*.cpp' -o -name '*.hpp' \) 2>/dev/null || true)
+if [ -n "$stale" ]; then
+  echo "sweep: these sources are newer than $SIM -- rebuild with 'make' before trusting this run:" >&2
+  echo "$stale" | sed 's/^/  /' >&2
+  echo >&2
+fi
+
+# Ideal is the default, so a resource is made ideal unless asked to be real.
+sim_flags=""
+[ "$real_bus" -eq 0 ]    && sim_flags="$sim_flags --perfect-bus"
+[ "$real_memory" -eq 0 ] && sim_flags="$sim_flags --perfect-memory"
+[ "$do_check" -eq 1 ]    && sim_flags="$sim_flags --check"
+
+describe() {
+  if [ "$real_bus" -eq 1 ] && [ "$real_memory" -eq 1 ]; then echo "bus + memory constrained"
+  elif [ "$real_bus" -eq 1 ];    then echo "bus constrained, memory ideal"
+  elif [ "$real_memory" -eq 1 ]; then echo "memory constrained, bus ideal"
+  else echo "ideal bus + memory (traffic only)"
+  fi
+}
+
+traces=$(ls traces/*.trace 2>/dev/null || true)
+if [ -z "$traces" ]; then
+  echo "sweep: no traces found in traces/ -- run 'make traces'" >&2
+  exit 1
+fi
+
+echo "model: $(describe)"
+[ "$do_check" -eq 1 ] && echo "state-machine checking: enabled (MESI, MOSI, MOESI)"
+
+failures=0
+for trace in $traces; do
+  printf '\n=== %s\n' "$trace"
+  "$SIM" --row-header
+  for protocol in $PROTOCOLS; do
+    # shellcheck disable=SC2086
+    if ! "$SIM" --trace "$trace" --protocol "$protocol" --row $sim_flags; then
+      printf '%-8s FAILED\n' "$protocol"
+      failures=$((failures + 1))
+    fi
+  done
+done
+
+echo
+if [ "$failures" -eq 0 ]; then
+  echo "all runs completed"
+else
+  echo "$failures run(s) failed" >&2
+  exit 1
+fi

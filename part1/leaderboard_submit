@@ -1,0 +1,377 @@
+#!/bin/bash
+#
+# Submits your design to the class leaderboard.
+#
+#   ./leaderboard_submit              measure and submit
+#   ./leaderboard_submit --dry-run    measure and report, but do not submit
+#   ./leaderboard_submit --group NAME set your group name without being asked
+#
+# The first run asks for your group name and remembers it in ~/.lab2_group, so
+# every member of a group lands on one leaderboard row instead of competing
+# with each other. Whichever of you submitted most recently is the one shown.
+#
+# Everything is measured in one run, from one build, from one copy of your
+# source. That is deliberate: the cycle counts, the area and the timing on the
+# leaderboard are all guaranteed to describe the same design.
+#
+# What it does:
+#   1. fingerprints your source files
+#   2. rebuilds from scratch  (make clean; make)
+#   3. runs every trace and records the completion cycle of each
+#   4. runs synthesis at the class-wide clock period
+#   5. re-checks the fingerprint, and refuses to submit if anything changed
+#   6. copies the raw logs, the reports and your source into the drop directory
+#
+# Submitting does not grade anything and does not replace your real submission.
+# Run it as often as you like; the newest submission is the one that counts.
+
+set -u
+
+cd "$(dirname "$0")"
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+# Staff-managed drop directory. Students can create entries here but cannot
+# read or modify anyone else's.
+DROP_ROOT="${LEADERBOARD_DROP:-/afs/ece.cmu.edu/class/ece740/labs/lab2/leaderboard_F26}"
+
+# The leaderboard ranks on the clock your design actually closes at, and that
+# number is measured as (this period - the worst slack Genus reports). For the
+# comparison to mean anything, two things have to hold.
+#
+# Everyone must synthesize at the SAME period. That is what makes one team's
+# slack comparable to another's, and it is why the synthesis scripts are
+# fingerprinted below alongside your Verilog.
+#
+# The period must be one NOBODY can meet. Genus stops optimising the moment a
+# constraint is satisfied, so at a comfortable period every design reports a
+# slack of about zero and the column says nothing. Set it below what any design
+# can reach and the tool keeps working for minimum slack, which is exactly the
+# number being ranked.
+#
+# Staff: if any submission reports a non-negative slack, this is too high --
+# that design was left under-optimised and is being under-reported. Halve it.
+CLOCK_PERIOD=2.0
+
+TRACES="basic dependent_chain wide_ilp preg_pressure stress branch_basic branch_stress"
+
+# Files you write. These are what the fingerprint is really protecting.
+STUDENT_FILES="verilog_src/rename_modules/rob.sv
+verilog_src/rename_modules/iq.sv
+verilog_src/rename_modules/prf.sv
+verilog_src/rename_modules/rru.sv"
+
+# The interface files. You may change these, so they are not checked against a
+# reference -- they are fingerprinted so that the design measured for cycles is
+# provably the same one measured for area and timing.
+PROVIDED_FILES="verilog_src/rename_modules/rename_top.sv
+verilog_src/global_defines.svh
+verilog_src/tb_top.sv"
+
+# The synthesis flow. Not yours to edit, and fingerprinted because the entire
+# frequency ranking rests on every team being constrained identically -- a
+# one-line change to design.sdc would otherwise buy an arbitrary clock.
+SYNTH_FILES="synth/run.py
+synth/scripts/run_synth.tcl
+synth/scripts/design.sdc
+synth/src/rename_top_setup.tcl"
+
+LIVE=traces/instructions.txt
+WORK=.leaderboard_work
+
+# Remembered between runs so nobody has to retype it, and so a group does not
+# split across rows because one member typed it differently.
+GROUP_FILE="$HOME/.lab2_group"
+
+dry_run=0
+group_arg=""
+while [ "$#" -gt 0 ]; do
+  case "${1#--}" in
+    dry-run|dry_run|n) dry_run=1 ;;
+    group)             shift; group_arg="${1:-}" ;;
+    group=*)           group_arg="${1#--group=}" ;;
+    help|h) sed -n '2,/^$/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+    *) echo "leaderboard_submit: unknown flag '$1' (try --help)" >&2
+       echo "  If this is part of a group name, quote it: --group 'my group'" >&2
+       exit 2 ;;
+  esac
+  shift
+done
+
+fail() { echo "" >&2; echo "leaderboard_submit: $*" >&2; exit 1; }
+
+# ---------------------------------------------------------------------------
+# Group name
+# ---------------------------------------------------------------------------
+# Folded to lowercase with runs of punctuation and spaces collapsed to a single
+# dash, so "Group 7", "group-7" and "GROUP  7" are all the same group. The
+# directory you submit into is still keyed by your username -- this only
+# controls which submissions get collapsed onto one leaderboard row.
+
+normalize_group() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -e 's/[^a-z0-9]\+/-/g' -e 's/^-//' -e 's/-$//'
+}
+
+GROUP=$(normalize_group "${group_arg:-${LAB2_GROUP:-}}")
+
+if [ -z "$GROUP" ] && [ -f "$GROUP_FILE" ]; then
+  GROUP=$(normalize_group "$(cat "$GROUP_FILE" 2>/dev/null)")
+fi
+
+if [ -z "$GROUP" ]; then
+  echo "Which group are you submitting for?"
+  echo "Use the same name as your partner -- it is what puts you on one row."
+  printf 'Group name: '
+  read -r reply || true
+  GROUP=$(normalize_group "$reply")
+  [ -n "$GROUP" ] || fail "a group name is required (or pass --group NAME)"
+fi
+
+if [ "$dry_run" -eq 0 ]; then
+  printf '%s\n' "$GROUP" > "$GROUP_FILE" 2>/dev/null || true
+fi
+
+# ---------------------------------------------------------------------------
+# 1. Fingerprint
+# ---------------------------------------------------------------------------
+# A single hash over every file that can affect a result. Taken before the run
+# and again after, so a design edited mid-run cannot produce a mixed result.
+
+hash_of() {
+  # sha256sum on RHEL; shasum elsewhere. Names are included, so moving code
+  # between files changes the fingerprint.
+  for f in $1; do
+    [ -f "$f" ] || fail "missing $f -- run this from part1/"
+  done
+  # shellcheck disable=SC2086
+  if command -v sha256sum >/dev/null 2>&1; then
+    cat $1 | sha256sum | cut -c1-64
+  else
+    cat $1 | shasum -a 256 | cut -c1-64
+  fi
+}
+
+# Synthesis reads src/*.sv, which ship as symlinks to the files you edit. If one
+# has been replaced by a real file, synthesis and simulation would be measuring
+# different code, which is the one thing this script exists to prevent.
+for f in iq prf rob rru rename_top; do
+  link="synth/src/$f.sv"
+  [ -L "$link" ] || fail "$link is not a symlink any more.
+  Synthesis would read different source than simulation.
+  Restore it with:  git checkout $link"
+done
+
+STUDENT_HASH_BEFORE=$(hash_of "$STUDENT_FILES")
+PROVIDED_HASH_BEFORE=$(hash_of "$PROVIDED_FILES")
+SYNTH_HASH=$(hash_of "$SYNTH_FILES")
+SHORT=$(echo "$STUDENT_HASH_BEFORE" | cut -c1-12)
+
+echo "design fingerprint : $SHORT"
+echo "clock constraint   : ${CLOCK_PERIOD} ns (a floor nobody is expected to meet)"
+echo
+
+rm -rf "$WORK"
+mkdir -p "$WORK/sim" "$WORK/synth"
+
+# ---------------------------------------------------------------------------
+# 2. Build from scratch
+# ---------------------------------------------------------------------------
+# Never reuse an existing simv. It may have been built from different source.
+
+echo "== building"
+make clean >/dev/null 2>&1
+if ! make > "$WORK/build.log" 2>&1; then
+  tail -20 "$WORK/build.log" >&2
+  fail "build failed -- see $WORK/build.log"
+fi
+echo "   ok"
+echo
+
+# ---------------------------------------------------------------------------
+# 3. Simulate every trace
+# ---------------------------------------------------------------------------
+
+RESTORE=""
+if [ -f "$LIVE" ]; then RESTORE=$(mktemp); cp "$LIVE" "$RESTORE"; fi
+cleanup() { [ -n "$RESTORE" ] && cp "$RESTORE" "$LIVE" && rm -f "$RESTORE"; }
+trap cleanup EXIT
+
+echo "== simulating"
+printf "   %-18s %12s  %s\n" trace cycles checks
+sim_ok=1
+CYCLES=""
+for t in $TRACES; do
+  src="traces/instructions_${t}.txt"
+  log="$WORK/sim/${t}.log"
+  if [ ! -f "$src" ]; then
+    printf "   %-18s %12s  %s\n" "$t" "-" "MISSING TRACE"
+    sim_ok=0
+    CYCLES="$CYCLES $t=NA"
+    continue
+  fi
+
+  cp "$src" "$LIVE"
+  ./simv > "$log" 2>&1
+
+  cycles=$(grep -oE '^\[PERF\] completion_cycle: [0-9]+' "$log" | grep -oE '[0-9]+$')
+  fails=$(grep -c '^\[ERROR\].*\(check\|test\) failed' "$log")
+  asserts=$(grep -c 'Offending' "$log")
+  early=$(grep -c 'Simulation ended early' "$log")
+
+  if [ "$early" -gt 0 ]; then
+    verdict="ABORTED"; cycles="NA"; sim_ok=0
+  elif [ "$fails" -gt 0 ] || [ "$asserts" -gt 0 ]; then
+    verdict="FAILED ($fails checks, $asserts assertions)"; sim_ok=0
+  elif [ -z "$cycles" ]; then
+    verdict="no [PERF] line -- is tb_top.sv modified?"; cycles="NA"; sim_ok=0
+  else
+    verdict="pass"
+  fi
+
+  printf "   %-18s %12s  %s\n" "$t" "$cycles" "$verdict"
+  CYCLES="$CYCLES $t=$cycles"
+done
+echo
+
+if [ "$sim_ok" -eq 0 ]; then
+  echo "   Note: a trace that does not pass is recorded as NA on the leaderboard."
+  echo "   Cycle counts are only meaningful for a design that is correct."
+  echo
+fi
+
+# ---------------------------------------------------------------------------
+# 4. Synthesis
+# ---------------------------------------------------------------------------
+
+echo "== synthesizing (this takes a few minutes)"
+command -v genus >/dev/null 2>&1 || fail "genus not found -- run this on a machine with the CAD tools"
+
+( cd synth && rm -rf Reps Results Logs && \
+  python3 run.py --batch --clock-period "$CLOCK_PERIOD" src/rename_top_setup.tcl ) \
+  > "$WORK/synth.log" 2>&1
+synth_status=$?
+
+if [ "$synth_status" -ne 0 ] || [ ! -d synth/Reps ]; then
+  tail -20 "$WORK/synth.log" >&2
+  fail "synthesis failed -- see $WORK/synth.log"
+fi
+
+cp -r synth/Reps "$WORK/synth/Reps" 2>/dev/null
+[ -f synth/Logs/run.log ] && cp synth/Logs/run.log "$WORK/synth/genus_run.log"
+
+# writeReports produces: area.rpt gates.rpt power.rpt qor.rpt timing.rpt
+# timing_detailed.rpt. All of them are copied above; the leaderboard reads area
+# and worst slack.
+missing_reports=""
+for r in area.rpt gates.rpt power.rpt qor.rpt timing.rpt timing_detailed.rpt; do
+  [ -f "synth/Reps/$r" ] || missing_reports="$missing_reports $r"
+done
+[ -n "$missing_reports" ] && echo "   note: reports not produced:$missing_reports"
+
+# Best-effort extraction, for your own feedback only. The staff side parses the
+# copied reports, so a number this fails to pick up is not lost.
+#
+# area.rpt tabulates one row per instance; the top-level row carries the total,
+# and its last numeric column is the area. In report_area's layout "Total Area"
+# is a column heading rather than a row label, so matching on the module name
+# is what actually finds the number.
+AREA=$(grep -E '(^|[[:space:]])RENAME_TOP([[:space:]]|$)' synth/Reps/area.rpt 2>/dev/null \
+       | grep -oE '[0-9]+\.[0-9]+' | tail -1)
+[ -z "$AREA" ] && AREA=$(grep -iE '^[[:space:]]*total' synth/Reps/area.rpt 2>/dev/null \
+       | grep -oE '[0-9]+\.[0-9]+' | tail -1)
+
+# Genus reports timing in picoseconds, as integers: "Slack:=  0", with the
+# verdict on the path header: "Path 1: MET (0 ps)". report_timing orders paths
+# worst-first, so Path 1 is the critical one.
+SLACK=$(grep -oE '^[[:space:]]*Slack:=[[:space:]]*-?[0-9]+' synth/Reps/timing.rpt 2>/dev/null \
+        | grep -oE '\-?[0-9]+$' | head -1)
+TIMING=$(grep -oE '^Path[[:space:]]+1:[[:space:]]+(MET|VIOLATED)' synth/Reps/timing.rpt 2>/dev/null \
+        | grep -oE 'MET|VIOLATED' | head -1)
+
+printf "   %-18s %s\n" "area" "${AREA:-see reports}"
+printf "   %-18s %s\n" "timing" "${TIMING:-see reports}"
+printf "   %-18s %s ps\n" "worst slack" "${SLACK:-?}"
+
+# The number the leaderboard ranks on. The constraint is deliberately out of
+# reach, so the slack is negative and this comes out above CLOCK_PERIOD: it is
+# the period your critical path actually needs. Shown here so you can iterate
+# without waiting for the nightly refresh.
+if [ -n "${SLACK:-}" ]; then
+  awk -v p="$CLOCK_PERIOD" -v s="$SLACK" 'BEGIN {
+    ach = p * 1000 - s;                       # ps
+    if (ach > 0)
+      printf "   %-18s %.3f ns  (%.1f MHz)\n", "achieved period", ach/1000, 1e6/ach;
+  }'
+fi
+echo
+
+# ---------------------------------------------------------------------------
+# 5. Re-check the fingerprint
+# ---------------------------------------------------------------------------
+
+STUDENT_HASH_AFTER=$(hash_of "$STUDENT_FILES")
+PROVIDED_HASH_AFTER=$(hash_of "$PROVIDED_FILES")
+
+if [ "$STUDENT_HASH_BEFORE" != "$STUDENT_HASH_AFTER" ] \
+   || [ "$PROVIDED_HASH_BEFORE" != "$PROVIDED_HASH_AFTER" ]; then
+  fail "your source changed while this was running.
+  The cycle counts and the synthesis results would describe different designs.
+  Nothing was submitted. Re-run it without editing anything."
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Manifest and drop
+# ---------------------------------------------------------------------------
+
+STAMP=$(date '+%Y%m%dT%H%M%S')
+ENTRY="${USER}/${STAMP}-${SHORT}"
+
+{
+  echo "user            $USER"
+  echo "group           $GROUP"
+  echo "submitted       $(date '+%Y-%m-%d %H:%M:%S %Z')"
+  echo "host            $(hostname)"
+  echo "student_hash    $STUDENT_HASH_BEFORE"
+  echo "provided_hash   $PROVIDED_HASH_BEFORE"
+  echo "clock_period    $CLOCK_PERIOD"
+  echo "synth_hash      $SYNTH_HASH"
+  echo "all_traces_pass $sim_ok"
+  echo "area            ${AREA:-unparsed}"
+  echo "timing          ${TIMING:-unparsed}"
+  echo "worst_slack_ps  ${SLACK:-unparsed}"
+  for kv in $CYCLES; do echo "cycles_${kv%%=*}      ${kv#*=}"; done
+} > "$WORK/manifest.txt"
+
+# Your source goes in too, so the fingerprint can be re-derived from the
+# submission itself rather than taken on trust.
+mkdir -p "$WORK/src"
+for f in $STUDENT_FILES $PROVIDED_FILES; do cp "$f" "$WORK/src/"; done
+
+echo "== manifest"
+sed 's/^/   /' "$WORK/manifest.txt"
+echo
+
+if [ "$dry_run" -eq 1 ]; then
+  echo "--dry-run given, nothing submitted. Results are in $WORK/"
+  exit 0
+fi
+
+[ -d "$DROP_ROOT" ] || fail "leaderboard directory not found: $DROP_ROOT
+  Are you on an AFS machine with the class volume mounted?"
+
+if ! mkdir -p "$DROP_ROOT/$ENTRY" 2>/dev/null; then
+  fail "could not create $DROP_ROOT/$ENTRY
+  Check that you have permission to submit."
+fi
+
+if ! cp -r "$WORK"/. "$DROP_ROOT/$ENTRY/" 2>/dev/null; then
+  fail "could not write to $DROP_ROOT/$ENTRY"
+fi
+
+echo "submitted as $ENTRY  (group: $GROUP)"
+echo "The leaderboard updates periodically; your group's newest submission is the"
+echo "one shown. If that group name looks wrong, re-run with --group NAME."
