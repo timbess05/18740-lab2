@@ -44,29 +44,27 @@ namespace {
 // Every state is reachable here, so unlike MESI and MOSI there is no state to
 // reject.
 std::optional<BusReqType> MOESIProtocol::request_for(AccessType access, CacheState state) const {
-  // Remove this line once you use the parameter.
-  (void)access;
-
   switch (state) {
   case CacheState::I:
-    // TODO:
-    break;
+    return access == AccessType::Read ? BusReqType::Read : BusReqType::ReadX;
 
   case CacheState::S:
-    // TODO:
-    break;
+    return access == AccessType::Read ? std::optional<BusReqType>{}
+                                      : std::optional<BusReqType>{BusReqType::Upgrade};
 
   case CacheState::E:
-    // TODO:
-    break;
+    return std::nullopt;
 
   case CacheState::O:
-    // TODO:
-    break;
+    return access == AccessType::Read ? std::optional<BusReqType>{}
+                                      : std::optional<BusReqType>{BusReqType::Upgrade};
 
   case CacheState::M:
-    // TODO:
-    break;
+    return std::nullopt;
+
+  default:
+    // E belongs to MESI and MOESI; MOSI can never produce it.
+    protocol_detail::reject_state(name(), access, state, "M, O, S and I");
   }
   not_implemented("request_for");
 }
@@ -85,40 +83,58 @@ std::optional<BusReqType> MOESIProtocol::request_for(AccessType access, CacheSta
 //   decision.writeback_needed   true if memory must be written
 ProtocolDecision MOESIProtocol::on_request(BusReqType type, uint32_t requestor_id,
                                            const std::vector<CacheState> &peer_states) const {
-  // Remove these two lines once you use the parameters.
-  (void)requestor_id;
-  (void)peer_states;
+  ProtocolDecision decision;
 
   switch (type) {
-  case BusReqType::Read:
-    // TODO: somebody wants a readable copy. This is the case where both
-    // optimisations are live at once.
-    //   - Up to four different states could supply the line. Which is the best
-    //     source, and which are merely acceptable?
-    //   - A supplier that was clean and a supplier that was dirty do not end
-    //     up in the same state. Handle them separately.
-    //   - The requestor's own destination depends on whether anyone else held
-    //     the line at all.
-    //   - Does memory ever need to be written on this path?
-    break;
-
-  case BusReqType::ReadX:
-    // TODO: somebody wants to write a line it does not hold.
-    //   - No other cache may keep a copy afterwards.
-    //   - The requestor becomes the new holder of the data, dirty or not. Is
-    //     there any peer state here that still forces a memory write?
-    break;
-
-  case BusReqType::Upgrade:
-    // TODO: the requestor already holds a readable copy and now wants to
-    // write it. Remember that under MOESI "readable" covers more than one
-    // state, and so does "holder" on the peer side.
-    break;
-
-  case BusReqType::Writeback:
-    // TODO: the requestor is evicting a dirty line. Two states are dirty under
-    // MOESI. No peer is involved.
+  case BusReqType::Read: {
+    // Prefer the M holder: it has the only up-to-date copy.
+    const auto supplier = find_supplier(peer_states, requestor_id, {CacheState::E, CacheState::M, CacheState::O, CacheState::S});
+    if (supplier) {
+      decision.data_from_peer = true;
+      decision.supplier_id = *supplier;
+      if (peer_states[*supplier] == CacheState::E) {
+        decision.peer_transitions.push_back({*supplier, CacheState::S});
+      }
+      if (peer_states[*supplier] == CacheState::M) {
+        decision.peer_transitions.push_back({*supplier, CacheState::O});
+      }
+      // An S supplier keeps its state, so it needs no transition entry.
+      decision.requestor_state = CacheState::S;
+    }
+    else {
+      decision.requestor_state = CacheState::E;
+    }
     break;
   }
-  not_implemented("on_request");
+
+  case BusReqType::ReadX: {
+    const auto supplier = find_supplier(peer_states, requestor_id, {CacheState::E, CacheState::M, CacheState::O, CacheState::S});
+    if (supplier) {
+      decision.data_from_peer = true;
+      decision.supplier_id = *supplier;
+    }
+    for (uint32_t holder : find_holders(peer_states, requestor_id)) {
+      decision.peer_transitions.push_back({holder, CacheState::I});
+    }
+    decision.requestor_state = CacheState::M;
+    break;
+  }
+
+  case BusReqType::Upgrade: {
+    // The requestor already holds the line in S, so no data moves and memory
+    // is untouched. All that is needed is to invalidate the other sharers.
+    for (uint32_t holder : find_holders(peer_states, requestor_id)) {
+      decision.peer_transitions.push_back({holder, CacheState::I});
+    }
+    decision.requestor_state = CacheState::M;
+    break;
+  }
+
+  case BusReqType::Writeback: {
+    decision.requestor_state = CacheState::I;
+    decision.writeback_needed = true;
+    break;
+  }
+  }
+  return decision;
 }
