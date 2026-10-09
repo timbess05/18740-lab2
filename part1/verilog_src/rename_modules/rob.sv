@@ -47,17 +47,26 @@ module ROB (
     logic [ROB_BIT-1:0] incoming_age, active_age;
     logic [ROB_BIT-1:0] entry_age [ROB_SIZE-1:0];
     logic [ROB_SIZE-1:0] killed, pending_result;
-    logic older_branch_pending;
-    logic [ROB_BIT-1:0] branch_scan_index;
+
+    localparam int BR_LEVELS = $clog2(ROB_SIZE);
+
+    logic [ROB_SIZE-1:0] branch_pending_next, branches_upper;
+    logic [ROB_SIZE-1:0] branch_prefix [0:BR_LEVELS];
+    logic [ROB_SIZE-1:0] upper_prefix [0:BR_LEVELS];
+    logic [ROB_SIZE-1:0] first_any, first_upper, oldest_branch_next;
+    logic [ROB_SIZE-1:0] blocked_branches_next;
+    logic [ROB_BIT-1:0] head_after_retire;
     logic [$clog2(PPL_WIDTH+1)-1:0] insert_offset;
 
     assign full = (ROB_SIZE - occupancy) < PPL_WIDTH;
+
     // Registered recovery state controls interface transactions and dispatch.
     assign recovery_busy = flushing;
     assign rob_stall = flushing;
     assign insert_cnt = flushing ? '0 : $countones(inserted_mask);
     assign incoming_age = flush_index - rob_head;
     assign active_age = ROB_BIT'(flush_target - 1'b1) - rob_head;
+
     assign accepted_flush = !reset && flush_en &&
                             rob_mem[flush_index].valid &&
                             rob_mem[flush_index].is_branch &&
@@ -74,6 +83,7 @@ module ROB (
         end
 
         live_executed_mask = '0;
+
         for (int i = 0; i < PPL_WIDTH; i++) begin
             if (!reset && executed_mask[i] &&
                 rob_mem[executed_index[i]].valid &&
@@ -86,20 +96,66 @@ module ROB (
     end
 
     // Resolve branches in order; nonbranch instructions remain out of order.
+    // Predict branch state AFTER this cycle's updates. Assignment priority
+    // matches rob_mem: removal, insertion, then accepted execution completion.
     always_comb begin
-        blocked_branches = '0;
-        older_branch_pending = 1'b0;
-        branch_scan_index = rob_head;
         for (int j = 0; j < ROB_SIZE; j++) begin
-            branch_scan_index = ROB_BIT'(rob_head + j);
-            if (rob_mem[branch_scan_index].valid &&
-                rob_mem[branch_scan_index].is_branch &&
-                !rob_mem[branch_scan_index].is_completed) begin
-                blocked_branches[branch_scan_index] = older_branch_pending;
-                older_branch_pending = 1'b1;
+            branch_pending_next[j] = rob_mem[j].valid &&
+                                     rob_mem[j].is_branch &&
+                                     !rob_mem[j].is_completed;
+        end
+
+        for (int i = 0; i < PPL_WIDTH; i++) begin
+            if (removed_mask[i])
+                branch_pending_next[removed_indexes[i]] = 1'b0;
+        end
+
+        if (!flushing) begin
+            for (int i = 0; i < PPL_WIDTH; i++) begin
+                if (inserted_mask[i]) begin
+                    branch_pending_next[inserted_index[i]] =
+                        inserted_entries[i].is_branch;
+                end
             end
         end
+
+        for (int i = 0; i < PPL_WIDTH; i++) begin
+            if (live_executed_mask[i])
+                branch_pending_next[executed_index[i]] = 1'b0;
+        end
     end
+
+    assign head_after_retire = ROB_BIT'(rob_head + retire_cnt);
+
+    // Static physical-slot wiring: first search [head, ROB_SIZE), then [0, head).
+    // Parallel prefix ORs find the first set bit without a rotating array scan.
+    generate
+        for (genvar j = 0; j < ROB_SIZE; j++) begin : gen_upper_branches
+            assign branches_upper[j] = branch_pending_next[j] &&
+                                       (ROB_BIT'(j) >= head_after_retire);
+        end
+
+        for (genvar s = 0; s < BR_LEVELS; s++) begin : gen_branch_prefix
+            assign branch_prefix[s+1] = branch_prefix[s] |
+                                       (branch_prefix[s] << (1 << s));
+
+            assign upper_prefix[s+1] = upper_prefix[s] |
+                                      (upper_prefix[s] << (1 << s));
+        end
+    endgenerate
+
+    assign branch_prefix[0] = branch_pending_next;
+    assign upper_prefix[0] = branches_upper;
+
+    assign first_any =
+        branch_pending_next & ~(branch_prefix[BR_LEVELS] << 1);
+
+    assign first_upper =
+        branches_upper & ~(upper_prefix[BR_LEVELS] << 1);
+
+    assign oldest_branch_next = (|branches_upper) ? first_upper : first_any;
+
+    assign blocked_branches_next = branch_pending_next & ~oldest_branch_next;
 
     always_comb begin
         removed_mask = '0;
@@ -116,7 +172,9 @@ module ROB (
 
         for (int i = 0; i < PPL_WIDTH; i++) begin
             inserted_index[i] = ROB_BIT'(rob_tail + insert_offset);
-            if (inserted_mask[i]) insert_offset = insert_offset + 1'b1;
+
+            if (inserted_mask[i])
+                insert_offset = insert_offset + 1'b1;
         end
 
         if (!reset) begin
@@ -151,7 +209,9 @@ module ROB (
                         committed_mask[i] = 1'b1;
                         retire_cnt = retire_cnt + 1'b1;
                     end
-                    else still_retiring = 1'b0;
+                    else begin
+                        still_retiring = 1'b0;
+                    end
                 end
             end
         end
@@ -159,16 +219,22 @@ module ROB (
 
     always_ff @(posedge clk) begin
         if (reset) begin
-            for (int j = 0; j < ROB_SIZE; j++) rob_mem[j] <= '0;
+            for (int j = 0; j < ROB_SIZE; j++)
+                rob_mem[j] <= '0;
+
             rob_head <= '0;
             rob_tail <= '0;
             occupancy <= '0;
             pending_result <= '0;
+            blocked_branches <= '0;
             flushing <= 1'b0;
             flush_ptr <= '0;
             flush_target <= '0;
         end
         else begin
+            // This is the mask for the NEW ROB state, not a delayed old mask.
+            blocked_branches <= blocked_branches_next;
+
             // Apply exactly the removal transaction presented during this cycle.
             for (int i = 0; i < PPL_WIDTH; i++) begin
                 if (removed_mask[i]) begin
@@ -187,24 +253,30 @@ module ROB (
                         pending_result[inserted_index[i]] <= 1'b0;
                     end
                 end
+
                 rob_tail <= ROB_BIT'(rob_tail + insert_cnt);
             end
 
             // The supplied execution interface cancels older in-flight wrong-path work.
             if (flush_en) begin
                 for (int j = 0; j < ROB_SIZE; j++) begin
-                    if (killed[j]) pending_result[j] <= 1'b0;
+                    if (killed[j])
+                        pending_result[j] <= 1'b0;
                 end
             end
+
             // Issues observed in the flush cycle are appended after that cancellation.
             for (int i = 0; i < PPL_WIDTH; i++) begin
                 if (issued_mask[i])
                     pending_result[issued_entries[i].rob_index] <= 1'b1;
             end
+
             for (int i = 0; i < PPL_WIDTH; i++) begin
                 if (executed_mask[i] && rob_mem[executed_index[i]].valid &&
-                    rob_mem[executed_index[i]].preg == executed_preg[i])
+                    rob_mem[executed_index[i]].preg == executed_preg[i]) begin
                     pending_result[executed_index[i]] <= 1'b0;
+                end
+
                 if (live_executed_mask[i])
                     rob_mem[executed_index[i]].is_completed <= 1'b1;
             end
@@ -214,11 +286,13 @@ module ROB (
 
             if (flushing) begin
                 flush_ptr <= next_ptr;
+
                 if (!accepted_flush && next_ptr == rob_tail) begin
                     rob_tail <= flush_target;
                     flushing <= 1'b0;
                 end
             end
+
             if (accepted_flush) begin
                 flush_target <= ROB_BIT'(flush_index + 1'b1);
                 flush_ptr <= ROB_BIT'(flush_index + 1'b1);
