@@ -1,65 +1,56 @@
 `default_nettype none
 
 module PRF (
-    input logic clk, reset,
-    input logic [PPL_WIDTH-1:0] inserted_mask,
-    input logic [PPL_WIDTH-1:0][PHYS_BIT-1:0] inserted_preg,
-    input logic [PPL_WIDTH-1:0] executed_mask,
-    input logic [PPL_WIDTH-1:0][PHYS_BIT-1:0] executed_preg,
-    input logic [PPL_WIDTH-1:0] committed_mask,
-    input logic [PPL_WIDTH-1:0] removed_mask,
-    input logic [PPL_WIDTH-1:0][PHYS_BIT-1:0] removed_preg,
-    input logic [PPL_WIDTH-1:0][ARCH_BIT-1:0] removed_areg,
+    input wire logic clk, reset,
+    input wire logic [PPL_WIDTH-1:0] inserted_mask,
+    input wire logic [PPL_WIDTH-1:0][PHYS_BIT-1:0] inserted_preg,
+    input wire logic [PPL_WIDTH-1:0] executed_mask,
+    input wire logic [PPL_WIDTH-1:0][PHYS_BIT-1:0] executed_preg,
+    input wire logic [PPL_WIDTH-1:0] committed_mask, removed_mask,
+    input wire logic [PPL_WIDTH-1:0][PHYS_BIT-1:0] removed_preg,
+    input wire logic [PPL_WIDTH-1:0][ARCH_BIT-1:0] removed_areg,
     output logic [PHYS_REG-1:0][1:0] preg_states,
     output logic [ARCH_REG-1:0][PHYS_BIT-1:0] archRAT
 );
+    localparam logic [1:0] AVAILABLE = 2'b00;
+    localparam logic [1:0] RENAMED_NOT_VALID = 2'b01;
+    localparam logic [1:0] RENAMED_VALID = 2'b10;
+    localparam logic [1:0] ARCHITECTURAL = 2'b11;
+    logic [PHYS_BIT-1:0] release_preg;
 
-    typedef enum logic [1:0] {
-        AVAILABLE = 2'b00,
-        RENAMED_NOT_VALID = 2'b01,
-        RENAMED_VALID = 2'b10,
-        ARCHITECTURAL = 2'b11
-    } preg_state_t;
-
-    logic [ARCH_REG-1:0][PHYS_BIT-1:0] archRAT_working;
-    logic [PHYS_REG-1:0][1:0] preg_states_working;
-
-    always_comb begin
-        archRAT_working = archRAT;
-        preg_states_working = preg_states;
-        for (int i = 0; i < PPL_WIDTH; i++) begin
-            if (inserted_mask[i])
-                preg_states_working[inserted_preg[i]] = RENAMED_NOT_VALID;
-        end
-        for (int i = 0; i < PPL_WIDTH; i++) begin
-            if (executed_mask[i] && preg_states[executed_preg[i]] == RENAMED_NOT_VALID)
-                preg_states_working[executed_preg[i]] = RENAMED_VALID;
-        end
-        // Removal has priority over every execution lane, not just the same lane.
-        for (int i = 0; i < PPL_WIDTH; i++) begin
-            if (committed_mask[i]) begin
-                preg_states_working[archRAT_working[removed_areg[i]]] = AVAILABLE;
-                archRAT_working[removed_areg[i]] = removed_preg[i];
-                preg_states_working[removed_preg[i]] = ARCHITECTURAL;
-            end
-            else if (removed_mask[i]) begin
-                preg_states_working[removed_preg[i]] = AVAILABLE;
+    // The area-first ROB emits only lane zero for both commit and undo.
+    assign release_preg = committed_mask[0]
+                        ? archRAT[removed_areg[0]] : removed_preg[0];
+    generate
+        for (genvar a = 0; a < ARCH_REG; a++) begin : gen_arch
+            always_ff @(posedge clk) begin
+                if (reset) archRAT[a] <= PHYS_BIT'(a);
+                else if (committed_mask[0] && removed_areg[0] == ARCH_BIT'(a))
+                    archRAT[a] <= removed_preg[0];
             end
         end
-    end
-
-    always_ff @(posedge clk) begin
-        if (reset) begin
-            for (int i = 0; i < ARCH_REG; i++) archRAT[i] <= PHYS_BIT'(i);
-            for (int i = 0; i < PHYS_REG; i++) begin
-                if (i < ARCH_REG) preg_states[i] <= ARCHITECTURAL;
-                else preg_states[i] <= AVAILABLE;
+        for (genvar p = 0; p < PHYS_REG; p++) begin : gen_preg
+            logic [PPL_WIDTH-1:0] insert_hit, execute_hit;
+            logic [1:0] next_state;
+            for (genvar lane = 0; lane < PPL_WIDTH; lane++) begin : gen_hits
+                assign insert_hit[lane] = inserted_mask[lane] && inserted_preg[lane] == PHYS_BIT'(p);
+                assign execute_hit[lane] = executed_mask[lane] && executed_preg[lane] == PHYS_BIT'(p);
+            end
+            always_comb begin
+                next_state = preg_states[p];
+                if (|insert_hit) next_state = RENAMED_NOT_VALID;
+                if ((|execute_hit) && preg_states[p] == RENAMED_NOT_VALID)
+                    next_state = RENAMED_VALID;
+                // Reclamation and commitment take priority over every response lane.
+                if (removed_mask[0] && release_preg == PHYS_BIT'(p))
+                    next_state = AVAILABLE;
+                if (committed_mask[0] && removed_preg[0] == PHYS_BIT'(p))
+                    next_state = ARCHITECTURAL;
+            end
+            always_ff @(posedge clk) begin
+                if (reset) preg_states[p] <= (p < ARCH_REG) ? ARCHITECTURAL : AVAILABLE;
+                else preg_states[p] <= next_state;
             end
         end
-        else begin
-            archRAT <= archRAT_working;
-            preg_states <= preg_states_working;
-        end
-    end
-
+    endgenerate
 endmodule : PRF

@@ -1,110 +1,112 @@
 `default_nettype none
 
 module RRU (
-    input logic clk, reset,
+    input wire logic clk, reset,
 
-    // Incoming register offers, including offers canceled by a same-cycle flush.
-    input logic [PPL_WIDTH-1:0] inserted_mask,
-    input instruction_t [PPL_WIDTH-1:0] inserted_entries,
+    // Offers stay stable if a branch resolves later in this cycle.
+    input wire logic [PPL_WIDTH-1:0] inserted_mask,
+    input wire instruction_t [PPL_WIDTH-1:0] inserted_entries,
+    input wire logic [PPL_WIDTH-1:0][ROB_BIT-1:0] inserted_index,
 
-    input logic [PPL_WIDTH-1:0] committed_mask,
-    input logic [PPL_WIDTH-1:0] removed_mask,
-    input logic [PPL_WIDTH-1:0][PHYS_BIT-1:0] removed_preg,
-    input logic [PPL_WIDTH-1:0][ARCH_BIT-1:0] removed_areg,
-    input logic [PPL_WIDTH-1:0] removed_is_branch,
+    input wire logic [PPL_WIDTH-1:0] committed_mask, removed_mask,
+    input wire logic [PPL_WIDTH-1:0][PHYS_BIT-1:0] removed_old_preg,
+    input wire logic [PPL_WIDTH-1:0][ARCH_BIT-1:0] removed_areg,
+    input wire logic [PHYS_REG-1:0][1:0] preg_states,
 
     output logic [PPL_WIDTH-1:0][PHYS_BIT-1:0] renamed_preg,
+    output logic [PPL_WIDTH-1:0][PHYS_BIT-1:0] renamed_old_preg,
     output rob_entry_t [PPL_WIDTH-1:0] renamed_rob_entries,
     output iq_entry_t [PPL_WIDTH-1:0] renamed_iq_entries,
-
-    input logic [PHYS_REG-1:0][1:0] preg_states,
-    input logic [ARCH_REG-1:0][PHYS_BIT-1:0] archRAT,
-    input logic [PPL_WIDTH-1:0][ROB_BIT-1:0] inserted_index,
-    output logic full,
-    output logic stall,
-    input logic flush_en,
-    input logic [ROB_BIT-1:0] flush_index
+    output logic full, stall
 );
+    localparam int CW = $clog2(PPL_WIDTH + 1);
+    localparam int OW = $clog2(PHYS_REG + 1);
 
-    logic [ARCH_REG-1:0][PHYS_BIT-1:0] specRAT, specRAT_working;
-    logic [ARCH_REG-1:0][PHYS_BIT-1:0] archRAT_working;
-    logic [PHYS_BIT-1:0] src1_preg, src2_preg;
-    logic [ARCH_REG-1:0] rat_dirty;
-    logic [PHYS_REG-1:0] preg_free, preg_free_working, preg_claimable;
-    instruction_t inserted_entry;
-    logic [PHYS_BIT:0] occupancy, preg_start;
-    logic [$clog2(PPL_WIDTH+1)-1:0] commit_cnt, insert_cnt, squash_cnt;
+    logic [ARCH_REG-1:0][PHYS_BIT-1:0] specRAT;
+    logic [ARCH_REG-1:0][PHYS_BIT-1:0] map_stage [0:PPL_WIDTH];
+    logic [PPL_WIDTH-1:0][PHYS_BIT-1:0] cache;
+    logic [CW-1:0] cache_count, insert_count, remove_count;
+    logic [PHYS_BIT-1:0] scan_ptr;
+    logic [OW-1:0] occupancy;
+    logic probe_free;
+    logic [CW-1:0] lane_rank [0:PPL_WIDTH-1];
 
-    logic [ARCH_REG-1:0][PHYS_BIT-1:0] rat_checkpoint [ROB_SIZE-1:0];
-    logic [PPL_WIDTH-1:0][ARCH_REG-1:0][PHYS_BIT-1:0] checkpoint_data;
-    logic [PPL_WIDTH-1:0] checkpoint_write;
-
-    assign commit_cnt = $countones(committed_mask);
-    // Canceled offers remain reserved until their noncommitting removal is reported.
-    assign insert_cnt = $countones(inserted_mask);
-    assign squash_cnt = $countones(removed_mask & ~committed_mask);
+    // Full describes actual allocated registers, not cached free-register offers.
     assign full = (PHYS_REG - occupancy) < PPL_WIDTH;
-    assign stall = 1'b0;
+    // Scan one physical register per cycle until a complete offer bundle is ready.
+    assign stall = cache_count != CW'(PPL_WIDTH);
+    assign insert_count = CW'($countones(inserted_mask));
+    assign remove_count = CW'($countones(removed_mask));
 
     always_comb begin
-        renamed_preg = '0;
+        probe_free = (preg_states[scan_ptr] == 2'b00);
+        for (int k = 0; k < PPL_WIDTH; k++) begin
+            if (k < cache_count && cache[k] == scan_ptr)
+                probe_free = 1'b0;
+        end
+    end
+
+    generate
+        for (genvar lane = 0; lane < PPL_WIDTH; lane++) begin : gen_tags
+            if (lane == 0) begin : gen_first
+                assign lane_rank[lane] = '0;
+            end else begin : gen_later
+                assign lane_rank[lane] = CW'($countones(inserted_mask[lane-1:0]));
+            end
+            assign renamed_preg[lane] = inserted_mask[lane]
+                                      ? cache[lane_rank[lane]] : '0;
+        end
+        // Only PPL_WIDTH shallow mapping stages; no ROB-indexed RAT snapshots.
+        for (genvar a = 0; a < ARCH_REG; a++) begin : gen_map
+            assign map_stage[0][a] = specRAT[a];
+            for (genvar lane = 0; lane < PPL_WIDTH; lane++) begin : gen_lane
+                assign map_stage[lane+1][a] =
+                    inserted_mask[lane] && inserted_entries[lane].dest == ARCH_BIT'(a)
+                    ? renamed_preg[lane] : map_stage[lane][a];
+            end
+            always_ff @(posedge clk) begin
+                if (reset)
+                    specRAT[a] <= PHYS_BIT'(a);
+                // ROB rolls back youngest first, one record on lane zero per cycle.
+                else if (removed_mask[0] && !committed_mask[0] &&
+                         removed_areg[0] == ARCH_BIT'(a))
+                    specRAT[a] <= removed_old_preg[0];
+                else
+                    specRAT[a] <= map_stage[PPL_WIDTH][a];
+            end
+        end
+    endgenerate
+
+    // Preserve exact source tags, including repeated writes within one bundle.
+    always_comb begin
+        renamed_old_preg = '0;
         renamed_rob_entries = '0;
         renamed_iq_entries = '0;
-        checkpoint_write = '0;
-        checkpoint_data = '0;
-        specRAT_working = specRAT;
-        archRAT_working = archRAT;
-        preg_free_working = preg_free;
-        preg_claimable = preg_free;
-        rat_dirty = '0;
-        preg_start = '0;
-        inserted_entry = '0;
-        src1_preg = '0;
-        src2_preg = '0;
-
-        // Process the four lanes in order, preserving same-bundle dependencies.
-        for (int i = 0; i < PPL_WIDTH; i++) begin
-            if (committed_mask[i]) begin
-                preg_free_working[archRAT_working[removed_areg[i]]] = 1'b1;
-                archRAT_working[removed_areg[i]] = removed_preg[i];
-            end
-            else if (removed_mask[i]) begin
-                preg_free_working[removed_preg[i]] = 1'b1;
-            end
-
-            // Keep the offered destination stable even when a late flush arrives.
-            if (inserted_mask[i]) begin
-                inserted_entry = inserted_entries[i];
-                src1_preg = specRAT_working[inserted_entry.src1];
-                src2_preg = specRAT_working[inserted_entry.src2];
-                renamed_iq_entries[i].src1 = src1_preg;
-                renamed_iq_entries[i].src2 = src2_preg;
-                renamed_iq_entries[i].src1_ready =
-                    !rat_dirty[inserted_entry.src1] &&
-                    (preg_states[src1_preg] == 2'b10 || preg_states[src1_preg] == 2'b11);
-                renamed_iq_entries[i].src2_ready =
-                    !rat_dirty[inserted_entry.src2] &&
-                    (preg_states[src2_preg] == 2'b10 || preg_states[src2_preg] == 2'b11);
-
-                for (int j = 0; j < PHYS_REG; j++) begin
-                    if (j >= preg_start && preg_claimable[j]) begin
-                        preg_free_working[j] = 1'b0;
-                        preg_claimable[j] = 1'b0;
-                        specRAT_working[inserted_entry.dest] = PHYS_BIT'(j);
-                        rat_dirty[inserted_entry.dest] = 1'b1;
-                        renamed_preg[i] = PHYS_BIT'(j);
-                        renamed_rob_entries[i].areg = inserted_entry.dest;
-                        renamed_rob_entries[i].preg = PHYS_BIT'(j);
-                        renamed_rob_entries[i].inst_ID = inserted_entry.inst_ID;
-                        renamed_rob_entries[i].is_branch = inserted_entry.is_branch;
-                        renamed_iq_entries[i].rob_index = inserted_index[i];
-                        renamed_iq_entries[i].inst_ID = inserted_entry.inst_ID;
-                        if (inserted_entry.is_branch) begin
-                            checkpoint_write[i] = 1'b1;
-                            checkpoint_data[i] = specRAT_working;
+        for (int lane = 0; lane < PPL_WIDTH; lane++) begin
+            if (inserted_mask[lane]) begin
+                renamed_old_preg[lane] = map_stage[lane][inserted_entries[lane].dest];
+                renamed_rob_entries[lane].areg = inserted_entries[lane].dest;
+                renamed_rob_entries[lane].preg = renamed_preg[lane];
+                renamed_rob_entries[lane].inst_ID = inserted_entries[lane].inst_ID;
+                renamed_rob_entries[lane].is_branch = inserted_entries[lane].is_branch;
+                renamed_iq_entries[lane].rob_index = inserted_index[lane];
+                renamed_iq_entries[lane].inst_ID = inserted_entries[lane].inst_ID;
+                renamed_iq_entries[lane].src1 = specRAT[inserted_entries[lane].src1];
+                renamed_iq_entries[lane].src2 = specRAT[inserted_entries[lane].src2];
+                renamed_iq_entries[lane].src1_ready =
+                    preg_states[specRAT[inserted_entries[lane].src1]][1];
+                renamed_iq_entries[lane].src2_ready =
+                    preg_states[specRAT[inserted_entries[lane].src2]][1];
+                for (int older = 0; older < PPL_WIDTH; older++) begin
+                    if (older < lane && inserted_mask[older]) begin
+                        if (inserted_entries[older].dest == inserted_entries[lane].src1) begin
+                            renamed_iq_entries[lane].src1 = renamed_preg[older];
+                            renamed_iq_entries[lane].src1_ready = 1'b0;
                         end
-                        preg_start = (PHYS_BIT+1)'(j + 1);
-                        break;
+                        if (inserted_entries[older].dest == inserted_entries[lane].src2) begin
+                            renamed_iq_entries[lane].src2 = renamed_preg[older];
+                            renamed_iq_entries[lane].src2_ready = 1'b0;
+                        end
                     end
                 end
             end
@@ -113,25 +115,23 @@ module RRU (
 
     always_ff @(posedge clk) begin
         if (reset) begin
-            for (int i = 0; i < ARCH_REG; i++) specRAT[i] <= PHYS_BIT'(i);
-            for (int i = 0; i < PHYS_REG; i++) begin
-                if (i < ARCH_REG) preg_free[i] <= 1'b0;
-                else preg_free[i] <= 1'b1;
-            end
-            occupancy <= ARCH_REG;
-        end
-        else begin
-            // The current canceled bundle must not change the restored mapping.
-            specRAT <= flush_en ? rat_checkpoint[flush_index] : specRAT_working;
-            preg_free <= preg_free_working;
-            occupancy <= occupancy - commit_cnt - squash_cnt + insert_cnt;
-            if (!flush_en) begin
-                for (int i = 0; i < PPL_WIDTH; i++) begin
-                    if (checkpoint_write[i])
-                        rat_checkpoint[inserted_index[i]] <= checkpoint_data[i];
+            cache <= '0;
+            cache_count <= '0;
+            scan_ptr <= PHYS_BIT'((ARCH_REG < PHYS_REG) ? ARCH_REG : 0);
+            occupancy <= OW'(ARCH_REG);
+        end else begin
+            occupancy <= occupancy + OW'(insert_count) - OW'(remove_count);
+            if (|inserted_mask) begin
+                // Unused cached tags in a partial bundle were never allocated.
+                cache_count <= '0;
+            end else if (cache_count < CW'(PPL_WIDTH)) begin
+                if (probe_free) begin
+                    cache[cache_count] <= scan_ptr;
+                    cache_count <= cache_count + 1'b1;
                 end
+                scan_ptr <= (scan_ptr == PHYS_BIT'(PHYS_REG-1))
+                          ? '0 : scan_ptr + 1'b1;
             end
         end
     end
-
 endmodule : RRU

@@ -4,7 +4,7 @@
 /*******************************************************
 * Design Parameters - Modify as per the Handout
 *******************************************************/
-parameter ROB_SIZE = 64;
+parameter ROB_SIZE = 128;
 parameter IQ_SIZE  = 64;
 
 
